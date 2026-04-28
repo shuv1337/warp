@@ -472,11 +472,11 @@ impl UserWorkspaces {
 
     /// Whether BYO API key is enabled for the current user, based on the active policies.
     /// Note that the value may be incorrect if called before the team's billing metadata has been fetched.
-    /// For solo users (no workspace), this is controlled by the `SoloUserByok` feature flag.
+    /// Solo users and signed-out users have no workspace policy, so local BYOK is always available.
     pub fn is_byo_api_key_enabled(&self) -> bool {
         self.current_workspace()
             .map(|workspace| workspace.is_byo_api_key_enabled())
-            .unwrap_or(FeatureFlag::SoloUserByok.is_enabled())
+            .unwrap_or(true)
     }
 
     pub fn aws_bedrock_host_settings(&self) -> Option<&super::workspace::LlmHostSettings> {

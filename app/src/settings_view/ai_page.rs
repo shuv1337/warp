@@ -42,7 +42,7 @@ use crate::view_components::{
     FilterableDropdown, SubmittableTextInput, SubmittableTextInputEvent,
 };
 use crate::workspaces::user_workspaces::UserWorkspacesEvent;
-use ::ai::api_keys::{ApiKeyManager, ApiKeys, CustomEndpointConfig};
+use ::ai::api_keys::{ApiKeyManager, ApiKeyManagerEvent, ApiKeys, CustomEndpointConfig};
 use ::ai::provider_registry::{providers, AuthType};
 use enum_iterator::all;
 use itertools::Itertools;
@@ -6035,6 +6035,12 @@ impl ApiKeysWidget {
             dropdown
         });
         Self::refresh_default_model_dropdown(&default_model_dropdown, ctx);
+        let dropdown_clone = default_model_dropdown.clone();
+        ctx.subscribe_to_model(&ApiKeyManager::handle(ctx), move |_, _, event, ctx| {
+            if matches!(event, ApiKeyManagerEvent::KeysUpdated) {
+                Self::refresh_default_model_dropdown(&dropdown_clone, ctx);
+            }
+        });
 
         Self {
             openai_api_key_editor,
@@ -6129,7 +6135,7 @@ impl ApiKeysWidget {
             .with_child(
                 Container::new(
                     render_ai_setting_description(
-                        "Use your own API keys from model providers for the Warp Agent to use. API keys are stored locally and never synced to the cloud. Using auto models or models from providers you have not provided API keys for will consume Warp credits.",
+                        "Set up local model providers for the Warp Agent. API keys are stored locally and never synced to the cloud. Pick a default BYOK model after adding a provider; auto models or providers without local credentials may consume Warp credits.",
                         is_enabled,
                         app,
                     ))
@@ -6338,7 +6344,7 @@ impl SettingsWidget for ApiKeysWidget {
     type View = AISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "api keys bring your own byo openai anthropic google claude gemini gpt"
+        "provider setup api keys bring your own byo openai anthropic google claude gemini gpt openrouter custom endpoint"
     }
 
     fn render(
@@ -6356,7 +6362,7 @@ impl SettingsWidget for ApiKeysWidget {
             .with_child(
                 build_sub_header(
                     appearance,
-                    "API Keys",
+                    "Provider Setup",
                     Some(styles::header_font_color(is_any_ai_enabled, app)),
                 )
                 .with_padding_bottom(HEADER_PADDING)

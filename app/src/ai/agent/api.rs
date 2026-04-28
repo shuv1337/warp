@@ -14,6 +14,7 @@ pub use r#impl::generate_multi_agent_output;
 
 use futures_lite::Stream;
 use serde::Serialize;
+use settings::Setting;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -233,12 +234,19 @@ impl RequestParams {
         let should_redact_secrets = get_secret_obfuscation_mode(app).should_redact_secret();
 
         let user_workspaces = UserWorkspaces::as_ref(app);
-        let api_keys = ApiKeyManager::as_ref(app).api_keys_for_request(
-            user_workspaces.is_byo_api_key_enabled(),
+        let api_key_manager = ApiKeyManager::as_ref(app);
+        let include_byo_keys =
+            user_workspaces.is_byo_api_key_enabled() || api_key_manager.keys().has_any_key();
+        let api_keys = api_key_manager.api_keys_for_request(
+            include_byo_keys,
             user_workspaces.is_aws_bedrock_credentials_enabled(app),
         );
         let allow_use_of_warp_credits_with_byok =
             *AISettings::as_ref(app).can_use_warp_credits_with_byok;
+        let byok_default_model = include_byo_keys
+            .then(|| AISettings::as_ref(app).default_model.value().clone())
+            .flatten()
+            .filter(|model| model.as_str() != "auto");
 
         let app_execution_mode = AppExecutionMode::as_ref(app);
         let autonomy_level = if app_execution_mode.is_autonomous() {
@@ -288,10 +296,18 @@ impl RequestParams {
             existing_suggestions: conversation.existing_suggestions,
             metadata,
             session_context,
-            model: request_input.model_id.clone(),
-            coding_model: request_input.coding_model_id.clone(),
-            cli_agent_model: request_input.cli_agent_model_id.clone(),
-            computer_use_model: request_input.computer_use_model_id.clone(),
+            model: byok_default_model
+                .clone()
+                .unwrap_or_else(|| request_input.model_id.clone()),
+            coding_model: byok_default_model
+                .clone()
+                .unwrap_or_else(|| request_input.coding_model_id.clone()),
+            cli_agent_model: byok_default_model
+                .clone()
+                .unwrap_or_else(|| request_input.cli_agent_model_id.clone()),
+            computer_use_model: byok_default_model
+                .clone()
+                .unwrap_or_else(|| request_input.computer_use_model_id.clone()),
             is_memory_enabled,
             warp_drive_context_enabled,
             mcp_context,

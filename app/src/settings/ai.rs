@@ -13,6 +13,7 @@ use crate::auth::AuthStateProvider;
 use crate::report_if_error;
 use crate::terminal::CLIAgent;
 use crate::workspaces::user_workspaces::UserWorkspaces;
+use ::ai::LLMId;
 use cfg_if::cfg_if;
 use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
@@ -1202,6 +1203,16 @@ define_settings_group!(AISettings, settings: [
         private: false,
         toml_path: "cloud_platform.third_party_api_keys.can_use_warp_credits_with_byok",
         description: "Whether Warp credits can be used even when providing your own API key.",
+    }
+
+    default_model: DefaultModel {
+        type: Option<LLMId>,
+        default: None,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "ai.default_model",
+        description: "Default AI model to use for bring-your-own-key providers.",
     }
 
     should_render_use_agent_footer_for_user_commands: ShouldRenderUseAgentToolbarForUserCommands {

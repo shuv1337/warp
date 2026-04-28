@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct LLMId(String);
+
+impl settings_value::SettingsValue for LLMId {}
 
 impl LLMId {
     pub fn as_str(&self) -> &str {

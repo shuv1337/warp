@@ -42,7 +42,8 @@ use crate::view_components::{
     FilterableDropdown, SubmittableTextInput, SubmittableTextInputEvent,
 };
 use crate::workspaces::user_workspaces::UserWorkspacesEvent;
-use ::ai::api_keys::{ApiKeyManager, ApiKeys};
+use ::ai::api_keys::{ApiKeyManager, ApiKeys, CustomEndpointConfig};
+use ::ai::provider_registry::{providers, AuthType};
 use enum_iterator::all;
 use itertools::Itertools;
 use regex::Regex;
@@ -2109,6 +2110,7 @@ pub enum AISettingsPageAction {
     ToggleAwsBedrockAutoLogin,
     ToggleAwsBedrockCredentialsEnabled,
     RefreshAwsBedrockCredentials,
+    SetDefaultByokModel(LLMId),
     ToggleCloudAgentComputerUse,
     ToggleFileBasedMcp,
     ToggleIncludeAgentCommandsInHistory,
@@ -2455,6 +2457,14 @@ impl TypedActionView for AISettingsPageView {
                     report_if_error!(settings
                         .can_use_warp_credits_with_byok
                         .toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::SetDefaultByokModel(model_id) => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings
+                        .default_model
+                        .set_value(Some(model_id.clone()), ctx));
                 });
                 ctx.notify();
             }
@@ -5802,6 +5812,11 @@ struct ApiKeysWidget {
     openai_api_key_editor: ViewHandle<EditorView>,
     anthropic_api_key_editor: ViewHandle<EditorView>,
     google_api_key_editor: ViewHandle<EditorView>,
+    open_router_api_key_editor: ViewHandle<EditorView>,
+    custom_endpoint_base_url_editor: ViewHandle<EditorView>,
+    custom_endpoint_api_key_editor: ViewHandle<EditorView>,
+    custom_endpoint_model_prefix_editor: ViewHandle<EditorView>,
+    default_model_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
 
     can_use_warp_credits_with_byok: SwitchStateHandle,
     upgrade_highlight_index: HighlightedHyperlink,
@@ -5818,13 +5833,16 @@ impl ApiKeysWidget {
             openai: openai_key,
             anthropic: anthropic_key,
             google: google_key,
+            open_router: open_router_key,
+            custom_endpoint,
+            env_sourced,
             ..
         } = ApiKeyManager::as_ref(ctx).keys().clone();
 
         // A helper macro to create and configure an API key editor.  This avoids a lot
         // of code duplication and ensures consistency between the editors.
         macro_rules! create_api_key_editor {
-            ($editor:ident, $key:ident, $set_func:ident, $placeholder:literal) => {
+            ($editor:ident, $key:ident, $set_func:ident, $placeholder:literal, $is_env_sourced:expr) => {
                 let $editor = ctx.add_typed_action_view(move |ctx| {
                     let appearance = Appearance::handle(ctx).as_ref(ctx);
                     let options = SingleLineEditorOptions {
@@ -5850,7 +5868,7 @@ impl ApiKeysWidget {
                 });
                 AISettingsPageView::update_editor_interaction_state(
                     $editor.clone(),
-                    is_any_ai_enabled && is_byo_enabled,
+                    is_any_ai_enabled && is_byo_enabled && !$is_env_sourced,
                     ctx,
                 );
                 ctx.subscribe_to_view(&$editor, |_, $editor, event, ctx| {
@@ -5892,28 +5910,208 @@ impl ApiKeysWidget {
             };
         }
 
-        create_api_key_editor!(openai_api_key_editor, openai_key, set_openai_key, "sk-...");
+        create_api_key_editor!(
+            openai_api_key_editor,
+            openai_key,
+            set_openai_key,
+            "sk-...",
+            env_sourced.openai
+        );
         create_api_key_editor!(
             anthropic_api_key_editor,
             anthropic_key,
             set_anthropic_key,
-            "sk-ant-..."
+            "sk-ant-...",
+            env_sourced.anthropic
         );
         create_api_key_editor!(
             google_api_key_editor,
             google_key,
             set_google_key,
-            "AIzaSy..."
+            "AIzaSy...",
+            env_sourced.google
         );
+        create_api_key_editor!(
+            open_router_api_key_editor,
+            open_router_key,
+            set_open_router_key,
+            "sk-or-...",
+            env_sourced.open_router
+        );
+
+        let custom_endpoint_base_url = custom_endpoint
+            .as_ref()
+            .map(|config| config.base_url.clone());
+        let custom_endpoint_api_key = custom_endpoint
+            .as_ref()
+            .and_then(|config| config.api_key.clone());
+        let custom_endpoint_model_prefix = custom_endpoint
+            .as_ref()
+            .and_then(|config| config.model_prefix.clone());
+
+        macro_rules! create_custom_endpoint_editor {
+            ($editor:ident, $value:ident, $placeholder:literal, $is_password:expr) => {
+                let $editor = ctx.add_typed_action_view(move |ctx| {
+                    let appearance = Appearance::handle(ctx).as_ref(ctx);
+                    let options = SingleLineEditorOptions {
+                        is_password: $is_password,
+                        text: TextOptions {
+                            font_size_override: Some(appearance.ui_font_size()),
+                            font_family_override: Some(appearance.monospace_font_family()),
+                            text_colors_override: Some(TextColors {
+                                default_color: appearance.theme().active_ui_text_color(),
+                                disabled_color: appearance.theme().disabled_ui_text_color(),
+                                hint_color: appearance.theme().disabled_ui_text_color(),
+                            }),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let mut editor = EditorView::single_line(options, ctx);
+                    editor.set_placeholder_text($placeholder, ctx);
+                    if let Some(value) = &$value {
+                        editor.set_buffer_text(value, ctx);
+                    }
+                    editor
+                });
+                AISettingsPageView::update_editor_interaction_state(
+                    $editor.clone(),
+                    is_any_ai_enabled && is_byo_enabled && !env_sourced.custom_endpoint_api_key,
+                    ctx,
+                );
+            };
+        }
+
+        create_custom_endpoint_editor!(
+            custom_endpoint_base_url_editor,
+            custom_endpoint_base_url,
+            "https://api.example.com/v1",
+            false
+        );
+        create_custom_endpoint_editor!(
+            custom_endpoint_api_key_editor,
+            custom_endpoint_api_key,
+            "sk-...",
+            true
+        );
+        create_custom_endpoint_editor!(
+            custom_endpoint_model_prefix_editor,
+            custom_endpoint_model_prefix,
+            "optional prefix",
+            false
+        );
+
+        for editor in [
+            custom_endpoint_base_url_editor.clone(),
+            custom_endpoint_api_key_editor.clone(),
+            custom_endpoint_model_prefix_editor.clone(),
+        ] {
+            let base_url_editor = custom_endpoint_base_url_editor.clone();
+            let api_key_editor = custom_endpoint_api_key_editor.clone();
+            let model_prefix_editor = custom_endpoint_model_prefix_editor.clone();
+            ctx.subscribe_to_view(&editor, move |_, _, event, ctx| {
+                if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                    let base_url = base_url_editor.as_ref(ctx).buffer_text(ctx);
+                    let api_key = api_key_editor.as_ref(ctx).buffer_text(ctx);
+                    let model_prefix = model_prefix_editor.as_ref(ctx).buffer_text(ctx);
+
+                    let config = (!base_url.trim().is_empty()).then_some(CustomEndpointConfig {
+                        base_url,
+                        api_key: (!api_key.trim().is_empty()).then_some(api_key),
+                        model_prefix: (!model_prefix.trim().is_empty()).then_some(model_prefix),
+                    });
+                    ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                        manager.set_custom_endpoint(config, ctx);
+                    });
+                }
+            });
+        }
+
+        let default_model_dropdown = ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+            dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+            dropdown.set_menu_max_height(AI_SETTINGS_DROPDOWN_MAX_HEIGHT, ctx);
+            dropdown
+        });
+        Self::refresh_default_model_dropdown(&default_model_dropdown, ctx);
 
         Self {
             openai_api_key_editor,
             anthropic_api_key_editor,
             google_api_key_editor,
+            open_router_api_key_editor,
+            custom_endpoint_base_url_editor,
+            custom_endpoint_api_key_editor,
+            custom_endpoint_model_prefix_editor,
+            default_model_dropdown,
 
             can_use_warp_credits_with_byok: Default::default(),
             upgrade_highlight_index: Default::default(),
         }
+    }
+
+    fn refresh_default_model_dropdown(
+        dropdown: &ViewHandle<Dropdown<AISettingsPageAction>>,
+        ctx: &mut ViewContext<AISettingsPageView>,
+    ) {
+        dropdown.update(ctx, |dropdown, ctx| {
+            let keys = ApiKeyManager::as_ref(ctx).keys();
+            let aws_enabled = UserWorkspaces::as_ref(ctx).is_aws_bedrock_credentials_enabled(ctx);
+            let mut items = vec![];
+
+            for provider in providers() {
+                let is_authenticated = match provider.id {
+                    "anthropic" => keys.anthropic.is_some(),
+                    "openai" => keys.openai.is_some(),
+                    "google" => keys.google.is_some(),
+                    "open_router" => keys.open_router.is_some(),
+                    "custom" => keys.custom_endpoint.is_some(),
+                    "aws_bedrock" => aws_enabled,
+                    _ => false,
+                };
+                if !is_authenticated {
+                    continue;
+                }
+
+                for model in provider.models {
+                    let label = if matches!(provider.auth_type, AuthType::AwsBedrock) {
+                        Cow::Owned(format!("{} ({})", model.label, provider.label))
+                    } else {
+                        Cow::Owned(format!("{} - {}", model.label, provider.label))
+                    };
+                    items.push(DropdownItem::new(
+                        label,
+                        AISettingsPageAction::SetDefaultByokModel(model.llm_id()),
+                    ));
+                }
+            }
+
+            if items.is_empty() {
+                dropdown.set_disabled(ctx);
+                dropdown.set_items(
+                    vec![DropdownItem::new(
+                        "Add a provider first",
+                        AISettingsPageAction::SetDefaultByokModel(LLMId::from("auto")),
+                    )],
+                    ctx,
+                );
+                dropdown.set_selected_by_index(0, ctx);
+            } else {
+                dropdown.set_enabled(ctx);
+                dropdown.set_items(items, ctx);
+                if let Some(model_id) = AISettings::as_ref(ctx).default_model.value().clone() {
+                    dropdown.set_selected_by_action(
+                        AISettingsPageAction::SetDefaultByokModel(model_id),
+                        ctx,
+                    );
+                } else {
+                    dropdown.set_selected_by_index(0, ctx);
+                }
+            }
+            ctx.notify();
+        });
+        ctx.notify();
     }
 
     fn render_api_keys_section(
@@ -5999,6 +6197,49 @@ impl ApiKeysWidget {
             is_enabled,
             app,
         ));
+        column.add_child(render_api_key_input(
+            appearance,
+            "OpenRouter API Key",
+            self.open_router_api_key_editor.clone(),
+            is_enabled,
+            app,
+        ));
+        column.add_child(render_api_key_input(
+            appearance,
+            "Custom Endpoint Base URL",
+            self.custom_endpoint_base_url_editor.clone(),
+            is_enabled,
+            app,
+        ));
+        column.add_child(render_api_key_input(
+            appearance,
+            "Custom Endpoint API Key",
+            self.custom_endpoint_api_key_editor.clone(),
+            is_enabled,
+            app,
+        ));
+        column.add_child(render_api_key_input(
+            appearance,
+            "Custom Endpoint Model Prefix",
+            self.custom_endpoint_model_prefix_editor.clone(),
+            is_enabled,
+            app,
+        ));
+
+        let default_model_label = Text::new_inline(
+            "Default BYOK Model",
+            appearance.ui_font_family(),
+            CONTENT_FONT_SIZE,
+        )
+        .with_color(styles::header_font_color(is_enabled, app).into())
+        .finish();
+        column.add_child(
+            Flex::column()
+                .with_spacing(8.)
+                .with_child(default_model_label)
+                .with_child(ChildView::new(&self.default_model_dropdown).finish())
+                .finish(),
+        );
 
         // Show upgrade CTA if BYOK is not enabled
         if !is_byo_enabled {

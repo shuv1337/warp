@@ -1,4 +1,5 @@
 pub use crate::aws_credentials::{AwsCredentials, AwsCredentialsState};
+use crate::provider_registry::providers;
 use serde::{Deserialize, Serialize};
 use warp_multi_agent_api as api;
 use warpui::{Entity, ModelContext, SingletonEntity};
@@ -22,6 +23,26 @@ pub struct ApiKeys {
     pub anthropic: Option<String>,
     pub openai: Option<String>,
     pub open_router: Option<String>,
+    pub custom_endpoint: Option<CustomEndpointConfig>,
+
+    #[serde(default, skip)]
+    pub env_sourced: EnvSourcedKeys,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CustomEndpointConfig {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub model_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EnvSourcedKeys {
+    pub google: bool,
+    pub anthropic: bool,
+    pub openai: bool,
+    pub open_router: bool,
+    pub custom_endpoint_api_key: bool,
 }
 
 impl ApiKeys {
@@ -30,6 +51,7 @@ impl ApiKeys {
             || self.anthropic.is_some()
             || self.google.is_some()
             || self.open_router.is_some()
+            || self.custom_endpoint.is_some()
     }
 }
 
@@ -57,7 +79,7 @@ pub struct ApiKeyManager {
 
 impl ApiKeyManager {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        let keys = Self::load_keys_from_secure_storage(ctx);
+        let keys = Self::load_keys_from_secure_storage(ctx).with_env_fallbacks();
         Self {
             keys,
             aws_credentials_state: AwsCredentialsState::Missing,
@@ -71,24 +93,39 @@ impl ApiKeyManager {
 
     pub fn set_google_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
         self.keys.google = key;
+        self.keys.env_sourced.google = false;
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }
 
     pub fn set_anthropic_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
         self.keys.anthropic = key;
+        self.keys.env_sourced.anthropic = false;
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }
 
     pub fn set_openai_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
         self.keys.openai = key;
+        self.keys.env_sourced.openai = false;
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }
 
     pub fn set_open_router_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
         self.keys.open_router = key;
+        self.keys.env_sourced.open_router = false;
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_custom_endpoint(
+        &mut self,
+        custom_endpoint: Option<CustomEndpointConfig>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.keys.custom_endpoint = custom_endpoint;
+        self.keys.env_sourced.custom_endpoint_api_key = false;
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }
@@ -209,6 +246,56 @@ impl ApiKeyManager {
         if let Err(e) = ctx.secure_storage().write_value(SECURE_STORAGE_KEY, &json) {
             log::error!("Failed to write API keys to secure storage: {e:#}");
         }
+    }
+}
+
+impl ApiKeys {
+    fn with_env_fallbacks(mut self) -> Self {
+        for provider in providers() {
+            let Ok(value) = std::env::var(provider.key_env_var) else {
+                continue;
+            };
+            if value.trim().is_empty() {
+                continue;
+            }
+
+            match provider.id {
+                "anthropic" if self.anthropic.is_none() => {
+                    self.anthropic = Some(value);
+                    self.env_sourced.anthropic = true;
+                }
+                "openai" if self.openai.is_none() => {
+                    self.openai = Some(value);
+                    self.env_sourced.openai = true;
+                }
+                "google" if self.google.is_none() => {
+                    self.google = Some(value);
+                    self.env_sourced.google = true;
+                }
+                "open_router" if self.open_router.is_none() => {
+                    self.open_router = Some(value);
+                    self.env_sourced.open_router = true;
+                }
+                "custom" => {
+                    let base_url = std::env::var("OPENAI_COMPATIBLE_BASE_URL")
+                        .or_else(|_| std::env::var("OPENAI_BASE_URL"))
+                        .ok();
+                    if self.custom_endpoint.is_none() {
+                        if let Some(base_url) = base_url {
+                            self.custom_endpoint = Some(CustomEndpointConfig {
+                                base_url,
+                                api_key: Some(value),
+                                model_prefix: std::env::var("OPENAI_COMPATIBLE_MODEL_PREFIX").ok(),
+                            });
+                            self.env_sourced.custom_endpoint_api_key = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self
     }
 }
 

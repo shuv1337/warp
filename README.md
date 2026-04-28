@@ -21,6 +21,9 @@
 > [!NOTE]
 > OpenAI is the founding sponsor of the new, open-source Warp repository, and the new agentic management workflows are powered by GPT models.
 
+> [!IMPORTANT]
+> This fork experiments with bringing OpenCode-style BYOK provider collection to Warp. It adds a provider registry, secure credential storage extensions, provider setup state, and AI settings controls for Anthropic, OpenAI, Google, OpenRouter, AWS Bedrock, and custom OpenAI-compatible endpoints.
+
 <h1></h1>
 
 ## About

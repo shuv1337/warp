@@ -3,6 +3,7 @@
 mod agent_onboarding_view;
 pub mod callout;
 mod model;
+pub mod provider_setup;
 pub mod slides;
 pub mod telemetry;
 

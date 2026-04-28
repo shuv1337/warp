@@ -11828,6 +11828,7 @@ impl TerminalView {
         self.hide_slow_bootstrap_banner(ctx);
 
         if self.auth_state.is_anonymous_or_logged_out()
+            && !ApiKeyManager::as_ref(ctx).keys().has_any_key()
             && !FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
         {
             self.insert_anonymous_user_ai_sign_up_banner(ctx);

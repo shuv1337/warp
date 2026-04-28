@@ -4,6 +4,7 @@
 //! cloud and local agent modes.
 
 use crate::appearance::Appearance;
+use crate::auth::AuthStateProvider;
 use crate::ui_components::icons::Icon;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
@@ -111,14 +112,22 @@ pub fn init(app: &mut AppContext) {
 }
 
 impl AgentTypeSelector {
-    pub fn new(_ctx: &mut ViewContext<Self>) -> Self {
+    pub fn new(ctx: &mut ViewContext<Self>) -> Self {
+        let selected_option_index = if AuthStateProvider::as_ref(ctx)
+            .get()
+            .is_anonymous_or_logged_out()
+        {
+            1
+        } else {
+            0
+        };
+
         Self {
             close_button_mouse_state: MouseStateHandle::default(),
             cloud_agent_mouse_state: MouseStateHandle::default(),
             local_agent_mouse_state: MouseStateHandle::default(),
             dialog_mouse_state: MouseStateHandle::default(),
-            // Cloud agent is selected by default (index 0).
-            selected_option_index: 0,
+            selected_option_index,
         }
     }
 

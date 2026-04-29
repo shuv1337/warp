@@ -129,6 +129,8 @@ pub async fn generate_multi_agent_output(
         mcp_context: params.mcp_context.map(Into::into),
     };
 
+    log_byok_request_shape(&request);
+
     let response_stream = server_api.generate_multi_agent_output(&request).await;
     match response_stream {
         Ok(stream) => {
@@ -141,6 +143,97 @@ pub async fn generate_multi_agent_output(
             Ok(Box::pin(rx))
         }
     }
+}
+
+/// Sanitized debug log of the outgoing multi-agent request shape.
+///
+/// Logs only structural metadata (model IDs, which API key fields are populated,
+/// task counts, conversation IDs, input variant). Never logs key values, prompt
+/// text, or tool arguments. Intended for diagnosing BYOK 400s from the Warp
+/// `/ai/multi-agent` proxy.
+fn log_byok_request_shape(request: &api::Request) {
+    let settings = request.settings.as_ref();
+    let model_config = settings.and_then(|s| s.model_config.as_ref());
+    let api_keys = settings.and_then(|s| s.api_keys.as_ref());
+    let task_context = request.task_context.as_ref();
+    let metadata = request.metadata.as_ref();
+
+    let model_base = model_config.map(|m| m.base.as_str()).unwrap_or("<none>");
+    let model_coding = model_config.map(|m| m.coding.as_str()).unwrap_or("<none>");
+    let model_cli_agent = model_config
+        .map(|m| m.cli_agent.as_str())
+        .unwrap_or("<none>");
+    let model_computer_use = model_config
+        .map(|m| m.computer_use_agent.as_str())
+        .unwrap_or("<none>");
+
+    let (anthropic_set, openai_set, google_set, open_router_set, aws_set, allow_warp_credits) =
+        match api_keys {
+            Some(k) => (
+                !k.anthropic.is_empty(),
+                !k.openai.is_empty(),
+                !k.google.is_empty(),
+                !k.open_router.is_empty(),
+                k.aws_credentials.is_some(),
+                k.allow_use_of_warp_credits,
+            ),
+            None => (false, false, false, false, false, false),
+        };
+
+    let task_count = task_context.map(|tc| tc.tasks.len()).unwrap_or(0);
+    let conversation_id = metadata
+        .map(|m| m.conversation_id.as_str())
+        .unwrap_or("<none>");
+    let forked_from = metadata
+        .map(|m| m.forked_from_conversation_id.as_str())
+        .unwrap_or("<none>");
+    let parent_agent_id = metadata
+        .map(|m| m.parent_agent_id.as_str())
+        .unwrap_or("<none>");
+    let agent_name = metadata.map(|m| m.agent_name.as_str()).unwrap_or("<none>");
+
+    let input_variant = request
+        .input
+        .as_ref()
+        .and_then(|i| i.r#type.as_ref())
+        .map(|t| match t {
+            api::request::input::Type::UserInputs(_) => "UserInputs",
+            api::request::input::Type::QueryWithCannedResponse(_) => "QueryWithCannedResponse",
+            api::request::input::Type::AutoCodeDiffQuery(_) => "AutoCodeDiffQuery",
+            api::request::input::Type::ResumeConversation(_) => "ResumeConversation",
+            api::request::input::Type::InitProjectRules(_) => "InitProjectRules",
+            api::request::input::Type::GeneratePassiveSuggestions(_) => {
+                "GeneratePassiveSuggestions"
+            }
+            api::request::input::Type::CreateNewProject(_) => "CreateNewProject",
+            api::request::input::Type::CloneRepository(_) => "CloneRepository",
+            api::request::input::Type::CodeReview(_) => "CodeReview",
+            api::request::input::Type::SummarizeConversation(_) => "SummarizeConversation",
+            api::request::input::Type::CreateEnvironment(_) => "CreateEnvironment",
+            api::request::input::Type::FetchReviewComments(_) => "FetchReviewComments",
+            api::request::input::Type::StartFromAmbientRunPrompt(_) => "StartFromAmbientRunPrompt",
+            api::request::input::Type::InvokeSkill(_) => "InvokeSkill",
+            #[allow(deprecated)]
+            api::request::input::Type::UserQuery(_) => "UserQuery(deprecated)",
+            #[allow(deprecated)]
+            api::request::input::Type::ToolCallResult(_) => "ToolCallResult(deprecated)",
+        })
+        .unwrap_or("<none>");
+
+    let has_existing_suggestions = request.existing_suggestions.is_some();
+    let has_mcp_context = request.mcp_context.is_some();
+
+    log::info!(
+        "[byok-debug] multi-agent request shape: \
+            model.base={model_base} model.coding={model_coding} \
+            model.cli_agent={model_cli_agent} model.computer_use={model_computer_use} \
+            api_keys{{anthropic={anthropic_set}, openai={openai_set}, google={google_set}, \
+            open_router={open_router_set}, aws={aws_set}, allow_warp_credits={allow_warp_credits}}} \
+            tasks={task_count} conversation_id=\"{conversation_id}\" \
+            forked_from=\"{forked_from}\" parent_agent_id=\"{parent_agent_id}\" \
+            agent_name=\"{agent_name}\" input={input_variant} \
+            existing_suggestions={has_existing_suggestions} mcp_context={has_mcp_context}"
+    );
 }
 
 fn get_supported_tools(params: &RequestParams) -> Vec<api::ToolType> {

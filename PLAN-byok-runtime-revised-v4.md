@@ -1504,15 +1504,23 @@ This checklist mirrors the §7 task ids exactly (B0–B13) plus Stage A and late
 
 ### Stage A
 
-- [ ] Add capture ignores.
-- [ ] Add `scripts/git/check-captures.sh` (diff-scoped, extension-anchored).
-- [ ] Wire pre-commit and CI to invoke the guard against staged diff / PR diff.
-- [ ] Validate guard against planted bad fixtures and legitimate `*.rs` mentions of `Bearer`/`Authorization`.
-- [ ] Write MITM docs (`docs/dev/mitm.md`).
-- [ ] Build MITM addon (`scripts/mitm/warp_addon.py`).
-- [ ] Capture redacted reference flows.
-- [ ] Decode `/ai/multi-agent` event streams (especially `StreamInit` field semantics).
-- [ ] Commit redacted index/summaries only.
+- [x] Add capture ignores. (`.gitignore`)
+- [x] Add `script/git/check-captures.sh` (diff-scoped, extension-anchored).
+      [Repo uses `script/` (singular) per existing convention; the v4 plan text
+      references `scripts/` but the implementation lives at `script/`.]
+- [x] Wire pre-commit and CI to invoke the guard against staged diff / PR diff.
+      Repo-managed hook at `script/git/hooks/pre-commit`, opt-in via
+      `script/git/install-hooks.sh`. CI step added to the `general-lint` job
+      in `.github/workflows/ci.yml`.
+- [x] Validate guard against planted bad fixtures and legitimate `*.rs` mentions
+      of `Bearer`/`Authorization`. Self-test at `script/git/check-captures.test.sh`
+      covers all six cases from §4.2 plus `bearer_auth` in synthetic Rust.
+- [x] Write MITM docs (`docs/dev/mitm.md`).
+- [x] Build MITM addon (`script/mitm/warp_addon.py`).
+- [ ] Capture redacted reference flows.   <!-- requires user at the keyboard -->
+- [ ] Decode `/ai/multi-agent` event streams (especially `StreamInit` field
+      semantics).                          <!-- requires real captures -->
+- [ ] Commit redacted index/summaries only. <!-- requires real captures -->
 
 ### Stage B
 

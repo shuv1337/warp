@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+#
+# Repo-managed pre-commit hook.
+#
+# Installed via script/git/install-hooks.sh, which sets `core.hooksPath` to
+# `script/git/hooks/`. Anything added here runs on every `git commit`.
+#
+# Today this only runs the capture guard. Add other fast checks below as
+# needed (keep it under a few hundred ms).
+#
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+"${repo_root}/script/git/check-captures.sh" --mode pre-commit

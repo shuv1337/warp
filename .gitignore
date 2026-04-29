@@ -55,3 +55,25 @@ desired_behavior.md
 
 # Don't include the python cache for bundled skills.
 __pycache__/
+
+# Local MITM captures may contain credentials, prompts, file contents, cookies,
+# and tokens. Keep them local. The committed catalog under captures/redacted/ is
+# the only thing allowed in this directory; everything else is denied.
+captures/*
+!captures/README.md
+!captures/INDEX.md
+!captures/redacted/
+!captures/redacted/**
+
+# Capture artifact extensions are denied anywhere in the tree (not just under
+# captures/). The denylist guard re-checks for secrets in any file that does
+# slip through into captures/redacted/.
+*.flow
+*.mitm
+*.request.bin
+*.response.bin
+*.request.pb
+*.response.pb
+*.sse
+*.decoded.pbtxt
+*.decoded.json

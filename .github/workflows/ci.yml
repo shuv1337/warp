@@ -589,6 +589,16 @@ jobs:
       - name: Validate repo-sync markers
         uses: warpdotdev/repo-sync/actions/validate-markers@main
 
+      - name: Capture artifact / secret guard
+        run: |
+          # PR diffs only; on master pushes there is no upstream comparison.
+          if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
+            git fetch --no-tags --depth=200 origin "$GITHUB_BASE_REF"
+            ./script/git/check-captures.sh --mode ci --base "origin/$GITHUB_BASE_REF"
+          else
+            echo "check-captures: no GITHUB_BASE_REF set; skipping (push event)."
+          fi
+
   wasm-lint:
     name: Formatting + Clippy (wasm)
     timeout-minutes: 20

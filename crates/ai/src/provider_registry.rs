@@ -55,6 +55,18 @@ pub const ANTHROPIC_MODELS: &[ModelDef] = &[
 
 pub const OPENAI_MODELS: &[ModelDef] = &[
     ModelDef {
+        id: "gpt-5.5",
+        label: "GPT-5.5",
+        context_window: 1_050_000,
+        supports_tools: true,
+    },
+    ModelDef {
+        id: "gpt-5.4-mini",
+        label: "GPT-5.4 Mini",
+        context_window: 400_000,
+        supports_tools: true,
+    },
+    ModelDef {
         id: "gpt-4o",
         label: "GPT-4o",
         context_window: 128_000,

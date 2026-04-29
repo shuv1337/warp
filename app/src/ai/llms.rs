@@ -1,3 +1,4 @@
+use ai::provider_registry::{providers, AuthType, ModelDef};
 use parking_lot::FairMutex;
 use serde::{de, Deserialize, Serialize};
 use std::{
@@ -231,6 +232,61 @@ pub fn dedupe_model_display_names<'a>(
     let mut sorted: Vec<String> = names.into_iter().collect();
     sorted.sort();
     sorted
+}
+
+pub fn local_byok_llm_info_for_id(id: &LLMId) -> Option<&'static LLMInfo> {
+    local_byok_llm_infos().iter().find(|info| &info.id == id)
+}
+
+pub fn local_byok_llm_infos() -> &'static [LLMInfo] {
+    static INFOS: OnceLock<Vec<LLMInfo>> = OnceLock::new();
+    INFOS.get_or_init(|| {
+        providers()
+            .iter()
+            .flat_map(|provider| {
+                provider.models.iter().map(move |model| {
+                    let llm_provider = match provider.id {
+                        "anthropic" => LLMProvider::Anthropic,
+                        "openai" => LLMProvider::OpenAI,
+                        "google" => LLMProvider::Google,
+                        _ => LLMProvider::Unknown,
+                    };
+                    local_byok_llm_info(model, provider.label, llm_provider, provider.auth_type)
+                })
+            })
+            .collect()
+    })
+}
+
+fn local_byok_llm_info(
+    model: &ModelDef,
+    provider_label: &str,
+    provider: LLMProvider,
+    auth_type: AuthType,
+) -> LLMInfo {
+    let display_name = if matches!(auth_type, AuthType::AwsBedrock) {
+        format!("{} ({})", model.label, provider_label)
+    } else {
+        format!("{} - {}", model.label, provider_label)
+    };
+
+    LLMInfo {
+        display_name: display_name.clone(),
+        base_model_name: display_name,
+        id: model.llm_id(),
+        reasoning_level: None,
+        usage_metadata: LLMUsageMetadata {
+            request_multiplier: 1,
+            credit_multiplier: None,
+        },
+        description: None,
+        disable_reason: None,
+        vision_supported: true,
+        spec: None,
+        provider,
+        host_configs: HashMap::new(),
+        discount_percentage: None,
+    }
 }
 
 impl LLMInfo {
@@ -573,6 +629,9 @@ impl LLMPreferences {
                 if let Some(llm_info) = self.models_by_feature.agent_mode.info_for_id(llm_id) {
                     return llm_info;
                 }
+                if let Some(llm_info) = local_byok_llm_info_for_id(llm_id) {
+                    return llm_info;
+                }
             }
         }
 
@@ -582,7 +641,12 @@ impl LLMPreferences {
             .data()
             .base_model
             .clone()
-            .and_then(|id| self.models_by_feature.agent_mode.info_for_id(&id))
+            .and_then(|id| {
+                self.models_by_feature
+                    .agent_mode
+                    .info_for_id(&id)
+                    .or_else(|| local_byok_llm_info_for_id(&id))
+            })
             .unwrap_or_else(|| self.models_by_feature.agent_mode.default_llm_info())
     }
 
@@ -606,7 +670,12 @@ impl LLMPreferences {
             .data()
             .coding_model
             .clone()
-            .and_then(|id| self.models_by_feature.coding.info_for_id(&id))
+            .and_then(|id| {
+                self.models_by_feature
+                    .coding
+                    .info_for_id(&id)
+                    .or_else(|| local_byok_llm_info_for_id(&id))
+            })
             .unwrap_or_else(|| self.models_by_feature.coding.default_llm_info())
     }
 
@@ -648,7 +717,11 @@ impl LLMPreferences {
             .data()
             .cli_agent_model
             .clone()
-            .and_then(|id| available.info_for_id(&id))
+            .and_then(|id| {
+                available
+                    .info_for_id(&id)
+                    .or_else(|| local_byok_llm_info_for_id(&id))
+            })
             .unwrap_or_else(|| available.default_llm_info())
     }
 
@@ -683,7 +756,11 @@ impl LLMPreferences {
             .data()
             .computer_use_model
             .clone()
-            .and_then(|id| available.info_for_id(&id))
+            .and_then(|id| {
+                available
+                    .info_for_id(&id)
+                    .or_else(|| local_byok_llm_info_for_id(&id))
+            })
             .unwrap_or_else(|| available.default_llm_info())
     }
 
@@ -704,7 +781,9 @@ impl LLMPreferences {
 
     /// Returns metadata about an LLM, if the client knows about it.
     pub fn get_llm_info(&self, id: &LLMId) -> Option<&LLMInfo> {
-        self.models_by_feature.info_for_id(id)
+        self.models_by_feature
+            .info_for_id(id)
+            .or_else(|| local_byok_llm_info_for_id(id))
     }
 
     /// Returns the default base model as a fallback.
@@ -729,6 +808,7 @@ impl LLMPreferences {
     #[cfg(feature = "integration_tests")]
     pub fn is_available_agent_mode_llm(&self, id: &LLMId) -> bool {
         self.models_by_feature.agent_mode.info_for_id(id).is_some()
+            || local_byok_llm_info_for_id(id).is_some()
     }
 
     /// Creates a pane-level override for the Agent Mode LLM.
@@ -745,7 +825,12 @@ impl LLMPreferences {
             .data()
             .base_model
             .as_ref()
-            .and_then(|id| self.models_by_feature.agent_mode.info_for_id(id))
+            .and_then(|id| {
+                self.models_by_feature
+                    .agent_mode
+                    .info_for_id(id)
+                    .or_else(|| local_byok_llm_info_for_id(id))
+            })
             .unwrap_or_else(|| self.models_by_feature.agent_mode.default_llm_info())
             .id
             .clone();

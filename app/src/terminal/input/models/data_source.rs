@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use fuzzy_match::{match_indices_case_insensitive, FuzzyMatchResult};
 use itertools::Itertools;
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
@@ -19,7 +21,7 @@ use warpui::{AppContext, Element, Entity, EntityId, SingletonEntity as _};
 
 use crate::ai::llms::{
     is_using_api_key_for_provider, DisableReason, LLMId, LLMInfo, LLMPreferences, LLMProvider,
-    LLMSpec,
+    LLMSpec, LLMUsageMetadata,
 };
 use crate::auth::AuthStateProvider;
 use crate::features::FeatureFlag;
@@ -35,6 +37,8 @@ use crate::terminal::input::inline_menu::{styles as inline_styles, DetailsRender
 use crate::terminal::input::message_bar::{Message, MessageItem};
 use crate::workspace::WorkspaceAction;
 use crate::workspaces::user_workspaces::UserWorkspaces;
+use ai::api_keys::ApiKeyManager;
+use ai::provider_registry::{providers, AuthType, ModelDef};
 use warpui::keymap::Keystroke;
 use warpui::platform::OperatingSystem;
 
@@ -161,7 +165,7 @@ impl SyncDataSource for ModelSelectorDataSource {
                 .clone()
         };
 
-        let choices: Vec<&LLMInfo> = if is_full_terminal {
+        let warp_choices: Vec<&LLMInfo> = if is_full_terminal {
             llm_preferences.get_cli_agent_llm_choices().collect_vec()
         } else {
             llm_preferences
@@ -169,20 +173,27 @@ impl SyncDataSource for ModelSelectorDataSource {
                 .collect_vec()
         };
 
+        let mut choices: Vec<ModelSearchItem> = byok_model_choices(app)
+            .iter()
+            .map(|llm| ModelSearchItem::new(llm, &active_llm_id, app, ModelSource::Byok))
+            .collect();
+        choices.extend(
+            warp_choices
+                .into_iter()
+                .map(|llm| ModelSearchItem::new(llm, &active_llm_id, app, ModelSource::Warp)),
+        );
+
         let query_text = query.text.trim().to_lowercase();
 
         if query_text.is_empty() {
-            return Ok(choices
-                .into_iter()
-                .map(|llm| QueryResult::from(ModelSearchItem::new(llm, &active_llm_id, app)))
-                .collect());
+            return Ok(choices.into_iter().map(QueryResult::from).collect());
         }
 
         Ok(choices
             .into_iter()
-            .filter_map(|llm| {
+            .filter_map(|item| {
                 let match_result = match_indices_case_insensitive(
-                    llm.display_name.to_lowercase().as_str(),
+                    item.display_text.to_lowercase().as_str(),
                     query_text.as_str(),
                 )?;
 
@@ -192,8 +203,7 @@ impl SyncDataSource for ModelSelectorDataSource {
                 }
 
                 Some(QueryResult::from(
-                    ModelSearchItem::new(llm, &active_llm_id, app)
-                        .with_name_match_result(Some(match_result.clone()))
+                    item.with_name_match_result(Some(match_result.clone()))
                         .with_score(OrderedFloat(match_result.score as f64)),
                 ))
             })
@@ -201,8 +211,74 @@ impl SyncDataSource for ModelSelectorDataSource {
     }
 }
 
+fn byok_model_choices(app: &AppContext) -> Vec<LLMInfo> {
+    let keys = ApiKeyManager::as_ref(app).keys();
+    let aws_enabled = UserWorkspaces::as_ref(app).is_aws_bedrock_credentials_enabled(app);
+
+    providers()
+        .iter()
+        .filter(|provider| match provider.id {
+            "anthropic" => keys.anthropic.is_some(),
+            "openai" => keys.openai.is_some(),
+            "google" => keys.google.is_some(),
+            "open_router" => keys.open_router.is_some(),
+            "custom" => keys.custom_endpoint.is_some(),
+            "aws_bedrock" => aws_enabled,
+            _ => false,
+        })
+        .flat_map(|provider| {
+            provider.models.iter().map(move |model| {
+                let provider_name = match provider.id {
+                    "anthropic" => LLMProvider::Anthropic,
+                    "openai" => LLMProvider::OpenAI,
+                    "google" => LLMProvider::Google,
+                    _ => LLMProvider::Unknown,
+                };
+                byok_llm_info(model, provider.label, provider_name, provider.auth_type)
+            })
+        })
+        .collect()
+}
+
+fn byok_llm_info(
+    model: &ModelDef,
+    provider_label: &str,
+    provider: LLMProvider,
+    auth_type: AuthType,
+) -> LLMInfo {
+    let display_name = if matches!(auth_type, AuthType::AwsBedrock) {
+        format!("{} ({})", model.label, provider_label)
+    } else {
+        format!("{} - {}", model.label, provider_label)
+    };
+
+    LLMInfo {
+        display_name: display_name.clone(),
+        base_model_name: display_name,
+        id: model.llm_id(),
+        reasoning_level: None,
+        usage_metadata: LLMUsageMetadata {
+            request_multiplier: 1,
+            credit_multiplier: None,
+        },
+        description: None,
+        disable_reason: None,
+        vision_supported: true,
+        spec: None,
+        provider,
+        host_configs: HashMap::new(),
+        discount_percentage: None,
+    }
+}
+
 impl Entity for ModelSelectorDataSource {
     type Event = ();
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelSource {
+    Byok,
+    Warp,
 }
 
 #[derive(Clone)]
@@ -219,10 +295,11 @@ struct ModelSearchItem {
     manage_api_key_mouse_state: MouseStateHandle,
     reasoning_level: Option<String>,
     discount_percentage: Option<f32>,
+    source: ModelSource,
 }
 
 impl ModelSearchItem {
-    fn new(llm: &LLMInfo, active_llm_id: &LLMId, app: &AppContext) -> Self {
+    fn new(llm: &LLMInfo, active_llm_id: &LLMId, app: &AppContext, source: ModelSource) -> Self {
         // If the model requires an upgrade but the user already has a BYOK key
         // for this provider, treat it as enabled by clearing the disable reason.
         let disable_reason = if llm.disable_reason == Some(DisableReason::RequiresUpgrade)
@@ -245,6 +322,7 @@ impl ModelSearchItem {
             manage_api_key_mouse_state: Default::default(),
             reasoning_level: llm.reasoning_level(),
             discount_percentage: llm.discount_percentage,
+            source,
         }
     }
 
@@ -330,7 +408,7 @@ impl SearchItem for ModelSearchItem {
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(text.finish());
 
-        if is_using_api_key_for_provider(&self.provider, app) {
+        if self.source == ModelSource::Byok {
             let key_icon =
                 ConstrainedBox::new(Icon::Key.to_warpui_icon(secondary_text_color).finish())
                     .with_width(font_size)
@@ -338,6 +416,27 @@ impl SearchItem for ModelSearchItem {
                     .finish();
             row = row.with_child(Container::new(key_icon).with_margin_left(6.).finish());
         }
+
+        let source_label = match self.source {
+            ModelSource::Byok => "BYOK",
+            ModelSource::Warp => "Warp",
+        };
+        let source_chip = Container::new(
+            Text::new_inline(
+                source_label.to_string(),
+                appearance.ui_font_family(),
+                font_size * 0.85,
+            )
+            .with_color(secondary_text_color.into())
+            .finish(),
+        )
+        .with_padding_left(4.)
+        .with_padding_right(4.)
+        .with_background(theme.surface_2())
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+        .with_margin_left(6.)
+        .finish();
+        row = row.with_child(source_chip);
 
         if self.is_selected {
             let selected_label = "(selected)";
@@ -424,7 +523,7 @@ impl SearchItem for ModelSearchItem {
         };
         let header = render_model_spec_header(title, description, app);
 
-        let is_using_api_key = is_using_api_key_for_provider(&self.provider, app);
+        let is_using_api_key = self.source == ModelSource::Byok;
         let cost_row = if is_using_api_key {
             let manage_button = appearance
                 .ui_builder()

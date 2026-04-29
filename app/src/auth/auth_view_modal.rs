@@ -150,6 +150,7 @@ const MODAL_WIDTH: f32 = 352.;
 pub enum AuthViewVariant {
     Initial,
     RequireLoginCloseable,
+    #[allow(dead_code)]
     HitDriveObjectLimitCloseable,
     ShareRequirementCloseable,
 }

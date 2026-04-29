@@ -69,6 +69,7 @@ pub enum AuthManagerEvent {
     /// refresh the entire user, only their token, which is when this event might be emitted.
     NeedsReauth,
     /// The user is anonymous and has attempted to access a login-gated feature or link.
+    #[allow(dead_code)]
     AttemptedLoginGatedFeature {
         auth_view_variant: AuthViewVariant,
     },
@@ -635,7 +636,7 @@ impl AuthManager {
     pub fn attempt_login_gated_feature(
         &self,
         feature: LoginGatedFeature,
-        auth_view_variant: AuthViewVariant,
+        _auth_view_variant: AuthViewVariant,
         ctx: &mut ModelContext<Self>,
     ) {
         if self.auth_state.is_anonymous_or_logged_out() {
@@ -643,16 +644,18 @@ impl AuthManager {
                 TelemetryEvent::AnonymousUserAttemptLoginGatedFeature { feature },
                 ctx
             );
-            ctx.emit(AuthManagerEvent::AttemptedLoginGatedFeature { auth_view_variant });
+            log::info!(
+                "Ignoring login-gated feature surface for logged-out user: {feature}. Login is only required for Warp subscription AI models."
+            );
         };
     }
 
     pub fn anonymous_user_hit_drive_object_limit(&self, ctx: &mut ModelContext<Self>) {
         if self.auth_state.is_anonymous_or_logged_out() {
             send_telemetry_from_ctx!(TelemetryEvent::AnonymousUserHitCloudObjectLimit, ctx);
-            ctx.emit(AuthManagerEvent::AttemptedLoginGatedFeature {
-                auth_view_variant: AuthViewVariant::HitDriveObjectLimitCloseable,
-            });
+            log::info!(
+                "Ignoring Drive object login gate for logged-out user. Login is only required for Warp subscription AI models."
+            );
         };
     }
 

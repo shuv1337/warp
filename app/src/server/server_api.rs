@@ -1073,11 +1073,24 @@ impl ServerApi {
         request: &warp_multi_agent_api::Request,
     ) -> std::result::Result<AIOutputStream<warp_multi_agent_api::ResponseEvent>, Arc<AIApiError>>
     {
-        let auth_token = self
-            .get_or_refresh_access_token()
-            .await
-            .map_err(Into::into)
-            .map_err(Arc::new)?;
+        // BYOK requests can be sent unauthenticated: when the user supplies
+        // their own provider keys, the Warp `/ai/multi-agent` proxy operates
+        // in passthrough mode and does not require a Warp account. For
+        // subscription (non-BYOK) requests we still require a logged-in user.
+        let has_byo_ai_credentials = request_has_byo_ai_credentials(request);
+        let auth_token = match self.get_or_refresh_access_token().await {
+            Ok(token) => Some(token),
+            Err(err) if has_byo_ai_credentials => {
+                log::info!("Sending BYOK multi-agent request without a Warp auth token: {err:?}");
+                None
+            }
+            Err(_) if !self.auth_state.is_logged_in() && !has_byo_ai_credentials => {
+                return Err(Arc::new(AIApiError::Other(anyhow!(
+                    "Log in to use Warp subscription AI models, or add a bring-your-own API key in AI settings."
+                ))));
+            }
+            Err(err) => return Err(Arc::new(err.into())),
+        };
 
         let is_passive = request.input.as_ref().is_some_and(|input| {
             matches!(
@@ -1108,7 +1121,10 @@ impl ServerApi {
             .post(url)
             .proto(request)
             .prevent_sleep("Agent Mode request in-progress");
-        if let Some(token) = auth_token.as_bearer_token() {
+        if let Some(token) = auth_token
+            .as_ref()
+            .and_then(|token| token.as_bearer_token())
+        {
             request_builder = request_builder.bearer_auth(token);
         }
 
@@ -1260,6 +1276,20 @@ impl ServerApi {
         log::info!("Received channel versions from Warp server: {versions}");
         Ok(versions)
     }
+}
+
+fn request_has_byo_ai_credentials(request: &warp_multi_agent_api::Request) -> bool {
+    request
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.api_keys.as_ref())
+        .is_some_and(|api_keys| {
+            !api_keys.anthropic.is_empty()
+                || !api_keys.openai.is_empty()
+                || !api_keys.google.is_empty()
+                || !api_keys.open_router.is_empty()
+                || api_keys.aws_credentials.is_some()
+        })
 }
 
 /// A singleton entity that provides access to the global [`ServerApi`] instance,

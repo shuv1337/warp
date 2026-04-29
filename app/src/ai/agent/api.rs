@@ -247,6 +247,13 @@ impl RequestParams {
             .then(|| AISettings::as_ref(app).default_model.value().clone())
             .flatten()
             .filter(|model| model.as_str() != "auto");
+        let is_byok_request = api_keys.as_ref().is_some_and(|keys| {
+            !keys.anthropic.is_empty()
+                || !keys.openai.is_empty()
+                || !keys.google.is_empty()
+                || !keys.open_router.is_empty()
+                || keys.aws_credentials.is_some()
+        });
 
         let app_execution_mode = AppExecutionMode::as_ref(app);
         let autonomy_level = if app_execution_mode.is_autonomous() {
@@ -287,27 +294,50 @@ impl RequestParams {
                 .as_ref()
                 .is_none_or(|t| matches!(t, crate::terminal::model::session::SessionType::Local));
 
+        let should_start_new_byok_conversation =
+            is_byok_request && conversation.server_conversation_token.is_none();
+        let conversation_token = conversation.server_conversation_token;
+        let forked_from_conversation_token = (!should_start_new_byok_conversation)
+            .then_some(conversation.forked_from_conversation_token)
+            .flatten();
+        let tasks = if should_start_new_byok_conversation {
+            Vec::new()
+        } else {
+            conversation.tasks
+        };
+        let existing_suggestions = if should_start_new_byok_conversation {
+            None
+        } else {
+            conversation.existing_suggestions
+        };
+
         Self {
             input: request_input.all_inputs().cloned().collect(),
-            conversation_token: conversation.server_conversation_token,
-            forked_from_conversation_token: conversation.forked_from_conversation_token,
+            conversation_token,
+            forked_from_conversation_token,
             ambient_agent_task_id: conversation.ambient_agent_task_id,
-            tasks: conversation.tasks,
-            existing_suggestions: conversation.existing_suggestions,
+            tasks,
+            existing_suggestions,
             metadata,
             session_context,
             model: byok_default_model
                 .clone()
                 .unwrap_or_else(|| request_input.model_id.clone()),
+            // Apply the BYOK default to the coding slot too so coding requests
+            // route through the user's BYOK provider. (`coding` is currently not
+            // sent on the wire, but keep it consistent with the base model.)
             coding_model: byok_default_model
                 .clone()
                 .unwrap_or_else(|| request_input.coding_model_id.clone()),
-            cli_agent_model: byok_default_model
-                .clone()
-                .unwrap_or_else(|| request_input.cli_agent_model_id.clone()),
-            computer_use_model: byok_default_model
-                .clone()
-                .unwrap_or_else(|| request_input.computer_use_model_id.clone()),
+            // Do NOT override cli_agent_model / computer_use_model with the BYOK
+            // base model. These slots have their own default IDs (e.g.
+            // `cli-agent-auto`, `computer-use-agent-auto`) that the server's
+            // BYOK router validates separately. Forcing a base model ID like
+            // `gpt-5.5` into them causes the multi-agent endpoint to return a
+            // generic 400 "Something went wrong with this conversation" for
+            // anonymous-context BYOK requests.
+            cli_agent_model: request_input.cli_agent_model_id.clone(),
+            computer_use_model: request_input.computer_use_model_id.clone(),
             is_memory_enabled,
             warp_drive_context_enabled,
             mcp_context,

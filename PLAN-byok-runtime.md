@@ -1,6 +1,6 @@
 # PLAN — In-process BYOK runtime + MITM observation of `app.warp.dev`
 
-> **Status:** draft, not started.
+> **Status:** revised after codebase review, not started.
 > **Owner:** TBD.
 > **Goal:** Logged-out BYOK `/agent` works end-to-end without contacting `app.warp.dev` for the agent loop, using the user's own provider key (OpenAI first, others next). Built so the runtime can be lifted into a standalone proxy later for cross-device sync.
 
@@ -23,6 +23,15 @@ We have already confirmed:
 - The rest of the OSS app (Drive, RTC, telemetry, model fetch, login) is hardcoded to `app.warp.dev` and **the OSS channel refuses `--server-root-url` overrides** by design (`Channel::allows_server_url_overrides()` returns `false` for `Channel::Oss`).
 
 There is no path to fixing logged-out BYOK by tweaking the request. We must produce the `ResponseStream` ourselves.
+
+Additional codebase findings incorporated in this revision:
+
+- `warp_multi_agent_api` is not a checked-in `crates/warp_multi_agent_api` crate. It is a git dependency pinned in root `Cargo.toml` to `warpdotdev/warp-proto-apis` rev `78a78f21a75432bf0141e396fb318bf1694e47f0`; the generated Rust crate exposes `get_descriptor_pool()` and `MESSAGE_DESCRIPTOR` via `prost-reflect`.
+- `http_client::RequestBuilder::proto()` sends raw `application/x-protobuf` request bytes. The `/ai/multi-agent` response stream is SSE, but each message `data` payload is a quoted, URL-safe-base64-encoded protobuf `ResponseEvent`, decoded today in `app/src/server/server_api.rs`.
+- `app/src/ai/agent/api.rs::RequestParams::new` currently clears `tasks` and `existing_suggestions` for a brand-new BYOK conversation with no server token. Therefore the first local runtime request must build context from `request.input`, not only from `task_context.tasks`.
+- The client starts each new conversation with an optimistic root task. The first server/runtime response must create or upgrade the root task before appending messages; otherwise `AddMessagesToTask` can hit `TaskNotInitialized` / `TaskNotFound` paths in `app/src/ai/agent/conversation.rs` and `app/src/ai/agent/task.rs`.
+- `app/src/ai/agent/api::ResponseStream` is `Stream<Item = Result<ResponseEvent, Arc<AIApiError>>>`. A new crate should not expose `anyhow::Error` directly to the app stream without an adapter, and provider/runtime errors should generally be represented as `StreamFinished` reasons once a stream has started.
+- `ContextFlag` values are enabled by default, but `ContextFlag::set` is debug-only and `FromStr` currently parses only a subset of flags. Do not rely on a new `ContextFlag` alone as the OSS escape hatch.
 
 ## Goals (this plan)
 
@@ -47,9 +56,11 @@ The runtime work in Stage B uses these captures as **the spec**: the easiest way
 
 - Production `http_client::Client` uses `reqwest::Client::builder()` defaults → respects `HTTPS_PROXY` / `HTTP_PROXY` env vars.
 - TLS root cert source: `reqwest`'s default (rustls + webpki on Linux) → respects `SSL_CERT_FILE` env var to add an extra trusted root.
+- Actual `reqwest` config uses `rustls-tls-native-roots-no-provider`, `system-proxy`, and `macos-system-configuration`. On macOS, prefer trusting the mitmproxy CA in the system keychain; `SSL_CERT_FILE` may still be useful on Linux and should be documented as platform-dependent.
 - WebSocket clients (`crates/websocket/`) already have their own proxy support via `HTTPS_PROXY` / `WSS_PROXY` / `ALL_PROXY` env vars.
 - Test client uses `tls_built_in_root_certs(false)` and `no_proxy()` — production does **not**, so MITM works without code changes.
 - One known gotcha: `app/src/ai/agent_sdk/test_support.rs` and `app/src/server/telemetry/mod.rs` build their own clients — verify those honor env proxy when relevant.
+- Response SSE payloads are not plain protobuf bytes on the wire. Decode each SSE `data:` value by trimming quotes, URL-safe-base64 decoding, then decoding `warp_multi_agent_api::ResponseEvent`.
 
 ### Tasks
 
@@ -62,11 +73,14 @@ The runtime work in Stage B uses these captures as **the spec**: the easiest way
 
 - [ ] **A2.** Build a small mitmproxy addon (`scripts/mitm/warp_addon.py`) that:
   - Logs only flows where `flow.request.host == "app.warp.dev"` (and `*.app.warp.dev`).
-  - For each flow, dumps `<timestamp>-<method>-<path>.{request,response}.bin` (raw bytes) and a sibling `.json` with method/path/headers/timestamps. SSE bodies are saved verbatim with `\n\n` event boundaries preserved.
-  - Recognises proto endpoints (`/ai/multi-agent`, `/ai/passive-suggestions`, anything else discovered) and additionally writes a `.proto-decoded.txt` using `protoc --decode` against `crates/warp_multi_agent_api/proto/*.proto` for easy diffing.
-  - Output dir: `captures/` (gitignored).
+  - For each flow, dumps `<timestamp>-<method>-<path>.{request,response}.bin` (raw bytes) and a sibling `.json` with method/path/status/headers/timestamps. Redact `Authorization`, provider keys, cookies, user prompts, file contents, and attachment data from committed summaries.
+  - SSE bodies are saved verbatim with `\n\n` event boundaries preserved. For `/ai/multi-agent`, additionally decode each SSE event's quoted URL-safe-base64 `data` into `ResponseEvent` protobuf bytes.
+  - Recognises proto endpoints (`/ai/multi-agent`, `/ai/passive-suggestions`, anything else discovered) and additionally writes a decoded text/JSON view. Do **not** point at non-existent `crates/warp_multi_agent_api/proto/*.proto`; use one of:
+    - Python generated proto modules from the pinned `warp-proto-apis` checkout.
+    - A tiny Rust decoder helper that depends on `warp_multi_agent_api` and uses `prost::Message` / `prost-reflect`.
+  - Output dir: `captures/` (gitignored). Commit only redacted fixture snippets or `captures/INDEX.md`, not raw sensitive flows.
 
-- [ ] **A3.** Capture canonical reference flows to disk (each labelled, committed as `.flow` if small enough or summarized in `captures/INDEX.md`):
+- [ ] **A3.** Capture canonical reference flows to disk (each labelled and summarized in `captures/INDEX.md`; raw `.flow` files stay local unless explicitly redacted):
   - Logged-in: fresh `/agent` text reply, no tools.
   - Logged-in: `/agent` that uses `RunShellCommand`, `ReadFiles`, `Grep`.
   - Logged-in: `/agent` resume of an existing conversation.
@@ -81,9 +95,9 @@ The runtime work in Stage B uses these captures as **the spec**: the easiest way
 
 ### Exit criteria for Stage A
 
-- We have at least 6 reference captures committed/referenced.
+- We have at least 6 reference captures referenced, with redacted summaries committed and raw sensitive captures kept out of git.
 - A new contributor can reproduce a capture in <10 minutes by following `docs/dev/mitm.md`.
-- We can grep a capture and produce the full sequence of `ResponseEvent`s for a real `/agent` request to use as the gold reference for Stage B's translator.
+- We can decode a capture and produce the full sequence of `ResponseEvent`s for a real `/agent` request to use as the gold reference for Stage B's translator, including whether a first-turn stream includes `CreateTask`.
 
 ---
 
@@ -95,11 +109,15 @@ A new crate `crates/byok_agent` exposes:
 
 ```rust
 // crates/byok_agent/src/lib.rs
-pub async fn run_request(
+pub fn run_request(
     request: warp_multi_agent_api::Request,
-    cancellation_rx: futures::channel::oneshot::Receiver<()>,
-) -> impl Stream<Item = Result<warp_multi_agent_api::ResponseEvent, anyhow::Error>>;
+    options: RuntimeOptions,
+) -> impl Stream<Item = Result<warp_multi_agent_api::ResponseEvent, RuntimeError>>;
 ```
+
+`app` adapts `RuntimeError` into `Arc<AIApiError>` only for pre-stream transport/setup failures. Once the local runtime has emitted `StreamInit`, provider failures should be converted to `ResponseEvent::StreamFinished` with `InvalidApiKey`, `QuotaLimit`, `ContextWindowExceeded`, `LlmUnavailable`, or `InternalError` so the existing controller renders them through `handle_response_stream_finished`.
+
+`RuntimeOptions` is needed because the current request proto carries first-party provider keys but does **not** carry the local custom endpoint config (`base_url`, optional key, model prefix) stored in `ApiKeyManager`.
 
 Internally:
 
@@ -115,18 +133,22 @@ crates/byok_agent/
       streaming.rs          // assistant-token + tool-call-arg streaming state machine
     providers/
       mod.rs                // trait LLMProvider; provider selection from api_keys + model id
-      openai.rs             // OpenAI Chat Completions streaming impl (initial)
+      openai.rs             // OpenAI streaming impl (Responses API preferred; Chat Completions fallback
+                            //   if needed for OpenAI-compatible providers)
     convert/
       from_warp.rs          // Request -> ProviderCall (messages, tools, model, opts)
       to_warp.rs            // assistant deltas / tool calls -> ResponseEvent stream
                             //   (BeginTransaction / AddMessagesToTask / AppendToMessageContent
                             //    / CommitTransaction / StreamFinished)
     error.rs                // BYOKError -> mapped onto stream as StreamFinished{InvalidApiKey,
-                            //   InternalError, LLMUnavailable, ContextWindowExceeded, etc.}
-    ids.rs                  // ULID/UUID generation for conversation_id, request_id, message_id, task_id
-  Cargo.toml                // deps: warp_multi_agent_api, reqwest, eventsource-stream, prost,
-                            //   futures, tokio, serde, serde_json, ulid, anyhow, log
+                            //   InternalError, LlmUnavailable, ContextWindowExceeded, etc.}
+    ids.rs                  // UUID/ULID generation for conversation_id, request_id, message_id, task_id
+  Cargo.toml                // deps: warp_multi_agent_api, reqwest, reqwest-eventsource or eventsource-stream,
+                            //   prost, prost-reflect, futures, tokio, serde, serde_json,
+                            //   uuid, anyhow/thiserror, log
 ```
+
+Add the crate to root `Cargo.toml` `[workspace.dependencies]` as `byok_agent = { path = "crates/byok_agent" }`, then add `byok_agent.workspace = true` to `app/Cargo.toml`. The workspace already includes `crates/*`, but default presubmit paths may still require explicit `cargo check -p byok_agent` until it is exercised through `app`.
 
 ### Interception point
 
@@ -134,15 +156,15 @@ Single edit in `app/src/ai/agent/api/impl.rs::generate_multi_agent_output`. Righ
 
 ```rust
 if should_route_locally(&request) {
-    let stream = byok_agent::run_request(request, /* cancellation hooked up */).await;
-    return Ok(Box::pin(stream.take_until(cancellation_rx)));
+    let stream = byok_agent::run_request(request, runtime_options);
+    return Ok(Box::pin(stream.map(map_runtime_error).take_until(cancellation_rx)));
 }
 ```
 
 `should_route_locally(&request)` returns true when:
 - BYOK keys are present in the request (`request_has_byo_ai_credentials`), AND
 - `model_config.base` resolves to a known BYOK model (in our `provider_registry`), AND
-- runtime is not disabled by a feature flag (give us an escape hatch — see B0).
+- runtime is not disabled by the local escape hatch (see B0).
 
 This means logged-in users with BYOK keys *also* get routed locally, which actually fixes their experience too (the logged-in BYOK path is currently slow + lossy because the Warp server is just a transport in that case).
 
@@ -170,11 +192,22 @@ Day-1 stubbed (advertised as unavailable, won't appear in tool list):
 - `WRITE_TO_LONG_RUNNING_SHELL_COMMAND`, `TRANSFER_SHELL_COMMAND_CONTROL_TO_USER` (later)
 - `UPLOAD_FILE_ARTIFACT` (artifact storage = server feature)
 
-The client builds the supported-tools list from feature flags + execution profile. We only need to *handle* the tools the model actually emits — the existing `BlocklistAIController` already executes them on receipt.
+The client builds the supported-tools list from feature flags + execution profile. The runtime must advertise only the intersection of:
+- tools in `request.settings.supported_tools`;
+- tools implemented in `byok_agent::runtime::tools`;
+- tools valid for the current session shape (`supported_cli_agent_tools` matters for CLI subagent/long-running command paths).
+
+If a provider emits an unadvertised or unknown tool anyway, finish the stream with `InternalError` instead of emitting a malformed `ToolCall`.
 
 ### Conversation rebuild
 
-Each new `Request` carries the full `task_context.tasks[].messages` from the client. The runtime treats every request as **stateless from its own perspective**: rebuild the provider-format message array fresh each turn from the proto. We never need server-side conversation persistence because the client already keeps it.
+Follow-up `Request`s carry the active task history in `task_context.tasks[].messages`. The runtime treats every request as **stateless from its own perspective**: rebuild the provider-format message array fresh each turn from the proto plus the current `request.input`. We never need server-side conversation persistence for Stage B because the client already keeps it after the initial stream.
+
+First-turn caveat: for a brand-new BYOK conversation, `RequestParams::new` currently sends an empty `task_context.tasks` and puts the user query only in `request.input`. The runtime must:
+- derive or mint a root `task_id`;
+- build provider input from `request.input.user_inputs`;
+- emit a `CreateTask` for the root task before any `AddMessagesToTask` / `AppendToMessageContent`;
+- use the server/runtime `request_id` consistently on emitted `Message`s so downstream history and telemetry stay coherent.
 
 `task_context.tasks` may have multiple tasks (subagents). Stage B handles only the **primary task** (find by `agent_type == AGENT_TYPE_PRIMARY` or just task[0] for now). Subagents are stubbed to error.
 
@@ -187,9 +220,11 @@ Mapping from Warp `Message` oneof variants to provider message roles:
 - `agent_reasoning` → drop for OpenAI; surface as `role: assistant` with extended_thinking for Anthropic later
 - everything else (todos updates, web search, etc.) → drop on Stage B
 
+The server-side hidden system prompt is not available from MITM captures because it is not sent by the client. Stage B needs an explicit local system prompt that describes Warp's agent behavior, tool-use protocol, safety/approval constraints, and output style. Treat this prompt as a versioned artifact in `crates/byok_agent/src/runtime/system_prompt.rs` and cover it with snapshot tests.
+
 ### Streaming response state machine
 
-OpenAI Chat Completions streaming yields chunks like:
+Provider streaming is normalized into `ProviderDelta`s. A Chat Completions-compatible stream yields chunks like:
 ```
 {"choices":[{"delta":{"role":"assistant"}}]}
 {"choices":[{"delta":{"content":"Hello"}}]}
@@ -201,16 +236,17 @@ OpenAI Chat Completions streaming yields chunks like:
 
 Translate to:
 ```
-ResponseEvent::StreamInit { conversation_id: <ULID>, request_id: <ULID>, run_id: <ULID> }
+ResponseEvent::StreamInit { conversation_id: <UUID/ULID>, request_id: <UUID/ULID>, run_id: <UUID/ULID> }
 ResponseEvent::ClientActions {
   actions: [
+    ClientAction::CreateTask { task: Task { id: <root_task_id>, ... } }, // first turn only if root is optimistic
     ClientAction::BeginTransaction {},
     ClientAction::AddMessagesToTask { task_id, messages: [Message{ id: msg_a, message: AgentOutput{ text: "" } }] }
   ]
 }
 ResponseEvent::ClientActions {
   actions: [
-    ClientAction::AppendToMessageContent { task_id, message: Message{ id: msg_a, message: AgentOutput{ text: "Hello" }}, mask: ["text"] },
+    ClientAction::AppendToMessageContent { task_id, message: Message{ id: msg_a, message: AgentOutput{ text: "Hello" }}, mask: ["message.agent_output.text"] },
   ]
 }
 ... more deltas ...
@@ -223,41 +259,43 @@ ResponseEvent::ClientActions {
 ResponseEvent::StreamFinished { reason: Done {} }
 ```
 
-Each `Message.id` we mint as a fresh ULID; client correlates them by id across `AppendToMessageContent` calls. `task_id` is taken from the inbound `task_context.tasks[primary].id` (or a fresh ULID if not present).
+Each `Message.id` we mint as a fresh UUID/ULID; client correlates them by id across `AppendToMessageContent` calls. `task_id` is taken from the inbound primary task when present; otherwise mint it for the first-turn `CreateTask` and reuse it for all actions in that stream. `conversation_id` should reuse `request.metadata.conversation_id` when provided and mint a new ID only for new conversations.
 
 We must reference Stage A captures to confirm the exact ordering and `mask` field-paths the client expects.
 
 ### OpenAI provider impl
 
-- Endpoint: `POST https://api.openai.com/v1/chat/completions` with `stream: true`, parsed via `eventsource-stream` (already a transitive dep via `reqwest_eventsource`).
+- Endpoint: prefer `POST https://api.openai.com/v1/responses` with `stream: true` for first-party OpenAI because OpenAI's current docs recommend Responses for typed streaming, tool calls, and reasoning models. Keep a Chat Completions adapter for OpenRouter/OpenAI-compatible endpoints that do not implement Responses.
 - Auth: `Authorization: Bearer <api_keys.openai>` from the inbound `Request.settings.api_keys.openai`.
 - Tool definitions: Warp `ToolType` → OpenAI `tools[].function` schema (one shared static catalog in `runtime/tools.rs`).
-- Reasoning: support `reasoning.effort` for `gpt-5*`, `o3*`, `o4*` (set to `medium` by default; expose via execution profile later).
+- Reasoning: support `reasoning.effort` where the selected endpoint/model accepts it (set to `medium` by default; expose via execution profile later). Do not send unsupported reasoning fields to OpenAI-compatible providers without capability gating.
 - Vision: forward image attachments as `image_url` parts when `vision_supported`.
 - Errors:
   - `401 invalid_api_key` → `StreamFinished::InvalidApiKey {}`
   - `429` → `StreamFinished::QuotaLimit { ... }`
   - `400 context_length_exceeded` → `StreamFinished::ContextWindowExceeded {}`
-  - `5xx` / network → `StreamFinished::LLMUnavailable {}`
+  - `5xx` / network → `StreamFinished::LlmUnavailable {}`
   - everything else → `StreamFinished::InternalError { message }`
 
 ### Cancellation
 
-The existing `cancellation_rx: futures::channel::oneshot::Receiver<()>` plumbed through `generate_multi_agent_output` already cuts the stream when the user clicks Stop. The runtime's HTTP request to OpenAI is cancelled by dropping the `reqwest_eventsource::EventSource` future when our outer stream is dropped. Verify with a long completion and a Stop click.
+The existing `cancellation_rx: futures::channel::oneshot::Receiver<()>` plumbed through `generate_multi_agent_output` already cuts the stream when the user clicks Stop. Do not consume the same oneshot inside `byok_agent`; let `take_until(cancellation_rx)` drop the local stream. The runtime's HTTP request to the provider is cancelled by dropping the underlying streaming response/EventSource future. Verify with a long completion and a Stop click.
 
 ### Tasks
 
-- [ ] **B0.** Feature flag escape hatch. Add `ContextFlag::ByokInProcessRuntime` (default on). Disabling it falls back to today's `app.warp.dev` path. This is our pressure-release if something breaks at the wire format level.
+- [ ] **B0.** Local escape hatch. Add a private local setting or env var such as `WARP_BYOK_IN_PROCESS_RUNTIME=0` (default on) that falls back to today's `app.warp.dev` path. Do not rely solely on `ContextFlag`: it is debug-set only in non-dogfood builds and `FromStr` currently omits several existing flags. If a `ContextFlag` is still added for deep-link contexts, update both the enum and `FromStr`.
 
-- [ ] **B1.** Create `crates/byok_agent` crate skeleton. Add to workspace `Cargo.toml`. Add `warp_multi_agent_api`, `reqwest`, `eventsource-stream`, `futures`, `serde`, `serde_json`, `ulid`, `anyhow`, `log`, `prost` as deps. CI builds.
+- [ ] **B1.** Create `crates/byok_agent` crate skeleton. Add to workspace dependencies and `app/Cargo.toml`. Add `warp_multi_agent_api`, `reqwest`, `reqwest-eventsource` or `eventsource-stream`, `futures`, `serde`, `serde_json`, `uuid`, `thiserror`/`anyhow`, `log`, `prost`, and `prost-reflect` as deps. `cargo check -p byok_agent` and `cargo check -p warp --bin warp-oss` build.
 
-- [ ] **B2.** `runtime/conversation.rs`: `Conversation::from_proto(&Request) -> Conversation` that walks `task_context.tasks[primary].messages` and produces an internal message list with stable `tool_call_id`s. Unit tests against fixtures (canned `Request` proto bytes from Stage A captures).
+- [ ] **B2.** `runtime/conversation.rs`: `Conversation::from_request(&Request) -> Conversation` that walks `task_context.tasks[primary].messages` **and** current `request.input.user_inputs`, then produces an internal message list with stable `tool_call_id`s. Unit tests against fixtures (canned `Request` proto bytes from Stage A captures plus synthetic first-turn empty-task fixtures).
 
-- [ ] **B3.** `runtime/tools.rs`: static `ToolCatalog` mapping Warp `ToolType` → JSON Schema `parameters`. Initially just the day-1 tools above, generated by hand from the proto definitions in `task.proto`. Round-trip tests: parse a tool_call back into a `warp_multi_agent_api::ToolCall` variant and assert structural equality against a known-good capture.
+- [ ] **B2a.** `runtime/system_prompt.rs`: add a local Warp agent system prompt and snapshot tests. This replaces server-side hidden orchestration instructions that MITM cannot capture.
 
-- [ ] **B4.** `convert/to_warp.rs`: streaming state machine that consumes assistant/tool deltas and yields `ResponseEvent`s in the right order. Unit tested with hand-crafted delta sequences against expected event sequences.
+- [ ] **B3.** `runtime/tools.rs`: static `ToolCatalog` mapping Warp `ToolType` → JSON Schema `parameters`. Initially just the day-1 tools above, generated by hand from the pinned proto definitions in `warp-proto-apis/apis/multi_agent/v1/task.proto`. Build the provider tool list from the request-supported intersection. Round-trip tests: parse a provider tool call back into a `warp_multi_agent_api::message::ToolCall` variant and assert structural equality against a known-good capture.
 
-- [ ] **B5.** `providers/openai.rs`: real OpenAI streaming call. Integration test (gated behind `OPENAI_API_KEY` env var, off in CI) that runs a no-tool prompt and asserts the resulting `ResponseEvent` stream has `StreamInit` → `BeginTransaction` → `AddMessagesToTask(AgentOutput)` → `AppendToMessageContent`* → `CommitTransaction` → `StreamFinished{Done}`.
+- [ ] **B4.** `convert/to_warp.rs`: streaming state machine that consumes assistant/tool deltas and yields `ResponseEvent`s in the right order. It must emit first-turn `CreateTask` when the request has no server task, then `BeginTransaction`, initial `AddMessagesToTask`, `AppendToMessageContent` with mask path `message.agent_output.text`, `CommitTransaction`, and `StreamFinished`. Unit tested with hand-crafted delta sequences against expected event sequences and Stage A captures.
+
+- [ ] **B5.** `providers/openai.rs`: real OpenAI streaming call. Integration test (gated behind `OPENAI_API_KEY` env var, off in CI) that runs a no-tool prompt and asserts the resulting `ResponseEvent` stream has `StreamInit` → optional first-turn `CreateTask` → `BeginTransaction` → `AddMessagesToTask(AgentOutput)` → `AppendToMessageContent`* → `CommitTransaction` → `StreamFinished{Done}`.
 
 - [ ] **B6.** `lib.rs::run_request` ties it together: pick provider from api_keys + model id, build conversation, build tool catalog, invoke provider, run the to-warp translator. Returns the `Stream<Item = Result<ResponseEvent, _>>`.
 
@@ -271,15 +309,20 @@ The existing `cancellation_rx: futures::channel::oneshot::Receiver<()>` plumbed 
 
 - [ ] **B11.** Cancellation works mid-stream; the OpenAI request is dropped within ~1s of Stop.
 
-- [ ] **B12.** Error-mapping smoke tests: bad key → `InvalidApiKey` reason rendered correctly in UI; oversize prompt → `ContextWindowExceeded`; network down → `LLMUnavailable`.
+- [ ] **B12.** Error-mapping smoke tests: bad key → `InvalidApiKey` reason rendered correctly in UI; oversize prompt → `ContextWindowExceeded`; network down → `LlmUnavailable`.
 
-- [ ] **B13.** Update `HANDOFF.md` (or the local `AGENTS.md`) noting the new component and its integration point.
+- [ ] **B13.** Add focused tests in `app/src/ai/agent/api/impl_tests.rs` for `should_route_locally`:
+  - BYOK OpenAI model + key + escape hatch on routes locally.
+  - No key, unknown model, passive suggestions, or escape hatch off falls back to server.
+  - Custom endpoint is not routed until `RuntimeOptions` carries usable endpoint config.
+
+- [ ] **B14.** Update `HANDOFF.md` (or the local `AGENTS.md`) noting the new component and its integration point.
 
 ### Exit criteria for Stage B
 
 - `/agent` works end-to-end logged-out with `gpt-5.5` and an OpenAI key, including tool-using prompts that run shell commands, read files, grep, glob, and edit files.
 - No request to `app.warp.dev/ai/multi-agent` for a BYOK request — verified by mitmproxy capture showing zero `/ai/*` traffic.
-- Disabling `ContextFlag::ByokInProcessRuntime` reverts to the old behaviour.
+- Disabling the local escape hatch reverts to the old behaviour.
 
 ---
 
@@ -306,9 +349,11 @@ The existing `cancellation_rx: futures::channel::oneshot::Receiver<()>` plumbed 
 
 - [ ] **C4.** `providers/openrouter.rs`: thin wrapper that points OpenAI client at `https://openrouter.ai/api/v1` with the OpenRouter key. Strip the `openrouter/` prefix from the model id before sending.
 
-- [ ] **C5.** `providers/openai_compatible.rs`: same as OpenAI but with a user-configurable `base_url` (for self-hosted vLLM, ollama-with-openai-shim, LM Studio, etc.). Driven by `provider_registry` + a per-provider settings entry.
+- [ ] **C5.** `providers/openai_compatible.rs`: same as OpenAI but with a user-configurable `base_url` (for self-hosted vLLM, ollama-with-openai-shim, LM Studio, etc.). Current custom endpoint config lives in `ApiKeyManager::keys().custom_endpoint` and is not serialized into `warp_multi_agent_api::request::settings::ApiKeys`, so plumb it through `RuntimeOptions` or add an explicit local-only request field before routing custom models locally.
 
-- [ ] **C6.** Provider-selection logic from request: priority `openai > anthropic > google > openrouter > openai_compatible`, but ultimately driven by the model id's prefix (`gpt-*` → openai, `claude-*` → anthropic, `gemini-*` → google, `openrouter/*` → openrouter, `custom/*` → openai-compatible). The `api_keys` block is consulted to pick which provider's key is used; missing keys produce `InvalidApiKey` upfront.
+- [ ] **C6.** Provider-selection logic from request/options: priority is model-id driven (`gpt-*` → openai, `claude-*` → anthropic, `gemini-*` → google, `openrouter/*` → openrouter, `custom/*` → openai-compatible, `aws-bedrock/*` deferred). The `api_keys` block and `RuntimeOptions` are consulted to pick credentials; missing keys produce `InvalidApiKey` upfront.
+
+- [ ] **C6a.** Add a real custom model identifier path. Today `provider_registry` exposes only `openrouter/custom` and `custom/openai-compatible`, which are placeholders rather than the actual provider model name. Add a per-provider model-name setting/input before claiming OpenRouter/custom endpoints work beyond smoke tests.
 
 - [ ] **C7.** Per-provider integration tests, all gated on env-var presence.
 
@@ -316,7 +361,7 @@ The existing `cancellation_rx: futures::channel::oneshot::Receiver<()>` plumbed 
 
 - All four providers successfully run the basic shell-tool E2E test.
 - Switching providers via the model picker just works.
-- A custom OpenAI-compatible endpoint (e.g. local ollama) works for at least one Llama-class model that supports tools.
+- A custom OpenAI-compatible endpoint (e.g. local ollama) works for at least one Llama-class model that supports tools, using an explicit configured model name rather than the placeholder `custom/openai-compatible`.
 
 ---
 
@@ -339,12 +384,14 @@ Until D1 ships, the in-process runtime suffices for the BYOK use case and the pr
 ## Risks and unknowns
 
 - **Wire-format drift.** Upstream Warp can change the `multi_agent.v1` proto. We sync against `warpdotdev/warp` master and pin our generated proto to a known revision; CI runs `cargo check` against new generations to catch breakage early.
-- **`mask` field paths.** `AppendToMessageContent` uses a `google.protobuf.FieldMask`. We need to confirm by capture exactly which paths the client expects (almost certainly `["text"]` for `AgentOutput`, but `["arguments"]`-style streaming for tool calls is also worth verifying).
+- **`mask` field paths.** `AppendToMessageContent` uses a `google.protobuf.FieldMask` applied against the full `Message` descriptor. For `AgentOutput.text`, the likely path is `message.agent_output.text`, not just `text`; confirm by capture and unit-test with `field_mask::FieldMaskOperation::append`.
 - **Tool argument streaming.** OpenAI streams tool-call argument JSON token-by-token. The Warp client may want a single `AddMessagesToTask` once arguments are complete, or it may handle progressive updates. Stage A capture answers this; default plan: buffer tool-call args until the function call is finished, then emit one `AddMessagesToTask`.
-- **Reasoning content.** `gpt-5*` reasoning models stream a separate reasoning channel. Map to `agent_reasoning` Warp message variant; if not supported by client, drop.
+- **Server prompt gap.** MITM captures client/server protobuf traffic but not the Warp server's hidden LLM system prompt. Local runtime quality will depend on our own prompt and tool descriptions.
+- **Reasoning content.** Reasoning models can stream reasoning-related events/metadata depending on endpoint. Map user-visible reasoning summaries to `agent_reasoning` only when available and when `supports_reasoning_message` is true; otherwise drop.
 - **Image attachments.** `Request.input.context.attachments` uses Warp's attachment proto. Day-1: surface text-only, ignore images; revisit when we have a capture to copy.
 - **Provider rate limits / 429s.** Need exponential backoff in the runtime to avoid wedging the UI on transient 429s. Already partially handled by `BlocklistAIController`'s retry logic but worth confirming it covers our error variants.
 - **`mitmproxy` certificate trust.** On Linux this just works via `SSL_CERT_FILE`. On macOS, system keychain trust may be needed (`security add-trusted-cert ...`). Worth documenting, off the critical path.
+- **Sensitive capture hygiene.** Raw captures can contain provider keys, prompts, file contents, attachment data, cookies, and bearer tokens. Keep raw captures gitignored and commit only redacted fixtures/summaries unless deliberately scrubbed.
 
 ## Out of scope (explicit)
 
